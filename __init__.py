@@ -1,159 +1,154 @@
-from functools import partial
-import maya.cmds as cmds
+# Constrain using keyframes
+
+import report
+import itertools
+import functools
 import maya.mel as mel
+import maya.cmds as cmds
 
-# Created 12/03/14 Jason Dixon
-# http://internetimagery.com/
+def warning(text):
+    cmds.warning(text)
+    cmds.confirmDialog(t="Uh oh...", m=text)
 
-#select objects that move first, then object to constrain to last.
-class constraintKey(object):
-    def __init__(self):
-        self.selection = []
-        self.timerange = []
-        self.locator = []
-        #begin!
-        cmds.undoInfo( openChunk = True)
-        self.selection = cmds.ls( selection=True )
-        if self.selection:
-            #check time range
-            slider = mel.eval('$tempvar = $gPlayBackSlider')
-            if cmds.timeControl( slider, rangeVisible = True, query=True ):
-                self.timerange = cmds.timeControl ( slider, query = True, rangeArray = True )
-            else:
-                if cmds.confirmDialog( title = 'Just checking...' , message = "Clicking confirm will constrain to the ENTIRE timeline.\n\nIs this what you want?" ) == 'Confirm':
-                    self.timerange = [ (cmds.playbackOptions( min = True, query = True )) , (cmds.playbackOptions( max = True, query = True )) ]
-            if self.timerange:
-                cmds.currentTime( self.timerange[0] )
-                if len(self.selection) == 1:
-                    self._createLocator( self.selection[0] )
-                else:
-                    for i in range(len(self.selection)-1):
-                        self._createLocator( self.selection[i] )
-        else:
-            cmds.confirmDialog( title = 'Whoops...', message = 'Nothing selected.')
-    def _translate(self, i, obj):
-        if i == self.timerange[1]:
-            cmds.cutKey( obj['obj'], at='translate', t=(self.timerange[0],self.timerange[1]), cl=True )
-        cmds.xform( obj['obj'] , ws = True, translation = cmds.getAttr( (obj['loc']+'.translate') )[0] )
-        cmds.setKeyframe( obj['obj'] , attribute = 'translate', time = i )
-    def _rotate(self, i, obj):
-        if i == self.timerange[1]:
-            cmds.cutKey( obj['obj'], at='rotate', t=(self.timerange[0],self.timerange[1]), cl=True )
-        rot = self._listmath( obj['offset'] , cmds.getAttr( (obj['loc']+'.rotate') )[0] , lambda x, y : x + y )
-        cmds.rotate( rot[0], rot[1], rot[2], obj['obj'], a = True )
-        cmds.setKeyframe( obj['obj'] , attribute = 'rotate', time = i )
-    def _loop(self, methods):
-        if self.locator and self.timerange:
-            euler = 'cmds.filterCurve('
-            bake = []
-            for loc in self.locator:
-                bake.append( loc['loc'] )
-                for at in ['_rotateX','_rotateY','_rotateZ']:
-                    euler+='"'+loc['loc']+at+'",'
-            cmds.bakeResults( bake, sm=True, t=(self.timerange[0],self.timerange[1]) )
-            eval( (euler+')') )
-            for loc in self.locator:
-                loc['offset'] = self._listmath( cmds.getAttr( (loc['loc']+'.rotate') )[0], loc['offset'], lambda x, y : y - x )
-            timerange = int(self.timerange[1] - self.timerange[0])+1
-            for i in range(timerange):
-                i = self.timerange[1]-i #make it run in reverse... because it looks cooler that way - like a zip zap machine
-                cmds.currentTime( i )
-                for obj in self.locator:
-                    for method in methods:
-                        method( i, obj )
-    def _createLocator(self, object):
-        locator = cmds.spaceLocator()[0]
-        cmds.xform( locator , roo = cmds.xform( object, query=True, roo=True ) )
-        cmds.delete( cmds.parentConstraint( object , locator ) )
-        self.locator.append( {  'loc':locator,
-                                'obj': object,
-                                'offset': cmds.getAttr( (object+'.rotate') )[0] } )
-    def _listmath(self, list1, list2, method):
+def shift(iterable, size):
+    """ iterate in groups ie [1,2,3] [2,3,4] """
+    i = itertools.tee(iterable, size)
+    for a, b in enumerate(i):
+        for c in range(a):
+            b.next()
+    return itertools.izip(*i)
+
+def chunk(iterable, size, default=None):
+    """ iterate in chunks ie [1,2,3] [4,5,6] """
+    i = iter(iterable)
+    return itertools.izip_longest(*[i]*size, fillvalue=default)
+
+class Callback(object):
+    """ generic callback """
+    def __init__(s, func, *args, **kwargs): s.__dict__.update(**locals())
+    def __call__(s, *_): return s.func(*s.args, **s.kwargs)
+
+
+class Main(object):
+    """ Constain quickly using keyframes """
+    def __init__(s):
+        with report.Report():
+            name = "constrainkeywin"
+
+            if cmds.window(name, q=True, ex=True):
+                cmds.deleteUI(name)
+
+            win = cmds.window(name, t="Constraint Key", rtf=True)
+            cmds.gridLayout(nc=2, cwh=(100, 30))
+            cmds.button(l="PARENT", c=Callback(s.constrain, cmds.parentConstraint, [0,1]))
+            cmds.button(l="PIVOT", c=Callback(s.constrain, cmds.parentConstraint, [1])) # Parent constraint rotation only
+            cmds.button(l="AIM", c=Callback(s.constrain, cmds.aimConstraint, [1]))
+            cmds.button(l="ORIENT", c=Callback(s.constrain, cmds.orientConstraint, [1]))
+            cmds.button(l="POINT", c=Callback(s.constrain, cmds.pointConstraint, [0]))
+            cmds.button(l="SCALE", c=Callback(s.constrain, cmds.scaleConstraint, [2]))
+            cmds.showWindow(win)
+
+    def get_selection(s):
+        """ Grab selected objects. Returns [obj1, obj2] """
+        sel = cmds.ls(sl=True, type="transform") or []
+        if len(sel) < 3: return sel
+        return []
+
+    def get_range(s):
+        """ Get frame range. Returns [min, max, is_selection] """
+        slider = mel.eval("$tmp = $gPlayBackSlider")
+        if cmds.timeControl(slider, q=True, rv=True):
+            return tuple(cmds.timeControl(slider, q=True, ra=True)), True
+        return (
+            cmds.playbackOptions(q=True, min=True),
+            cmds.playbackOptions(q=True, max=True)
+            ), False
+
+    @report.Report()
+    def constrain(s, constraint, attr):
+        """ Constrain objects """
+        selection = s.get_selection()
+        if not selection: return warning("Please select one or two objects.")
+
+        frame_range, selected = s.get_range()
+        if not selected and "Yes" != cmds.confirmDialog(b=("Yes", "No"), t="Confirming...", m="You have chosen to key the entire timeline.\nIs this ok?"):
+            return
+
+        err = cmds.undoInfo(openChunk=True)
         try:
-            new = []
-            for i in range(len(list1)):
-                new.append( self._listmath( list1[i] , list2[i], method ) )
-        except:
-            new = method( list1, list2 )
-        return new
-    def _glue(self, constraint, driver, locator, skip = []):
-        command = 'cmds.'+constraint+'Constraint("'+driver+'","'+locator['loc']+'",mo=True'
-        #maybe add in axis skips here? future update...
-        eval( (command+')') )
-    def __del__(self):
-        for locator in self.locator:
-            cmds.delete( locator['loc'] )
-        cmds.select( clear = True )
-        for obj in self.selection:
-            cmds.select( obj , add = True )
-        #end!
-        cmds.undoInfo( closeChunk = True)
+            if len(selection) == 1: # Constrain to world
+                data = s.stationary_data(frame_range, selection[0])
+                driven = selection[0]
+            if len(selection) == 2: # Constrain first obj to second
+                data = s.follow_data(constraint, frame_range, *selection)
+                driven = selection[1]
 
-    #constraints! parent / pivot / orient / point / aim
-    def parent(self):
-        if len(self.selection) > 1:
-            for obj in self.locator:
-                self._glue( 'parent' , self.selection[-1], obj )
-        self._loop([ self._translate , self._rotate ])
-    def pivot(self):
-        if len(self.selection) > 1:
-            for obj in self.locator:
-                self._glue( 'parent' , self.selection[-1], obj )
-        self._loop([ self._translate ])
-    def orient(self):
-        if len(self.selection) > 1:
-            for obj in self.locator:
-                self._glue( 'orient' , self.selection[-1], obj )
-        self._loop([ self._rotate ])
-    def point(self):
-        if len(self.selection) > 1:
-            for obj in self.locator:
-                self._glue( 'point' , self.selection[-1], obj )
-        self._loop([ self._translate ])
-    def aim(self): #requires two objects selected
-        if len(self.selection) > 1:
-            for obj in self.locator:
-                cmds.parentConstraint( obj['obj'], obj['loc'], mo=True, sr=['x','y','z'] )
-                self._glue( 'aim' , self.selection[-1], obj )
-            self._loop([ self._rotate ])
+            s.apply_keys(data, frame_range, attr, driven)
 
-class constraintKeyGUI(object):
-    def __init__(self):
-        #gui for constraints
-        self.pane = cmds.window( title = 'Constraint Key')
-        cmds.gridLayout( nc=2, cwh=[100, 30] )
-        cmds.button( label = 'PARENT', command = partial(self.run, 'parent') )
-        cmds.button( label = 'PIVOT', command = partial(self.run, 'pivot') )
-        cmds.button( label = 'AIM', command = partial(self.run, 'aim') )
-        cmds.button( label = 'ORIENT', command = partial(self.run, 'orient') )
-        cmds.button( label = 'POINT', command = partial(self.run, 'point') )
-        cmds.button( label = 'Create Shelf', command = self.shelf )
-        cmds.setParent('..')
-        cmds.showWindow( self.pane )
-    def run(self, command, blah):
-        run = 'constraintKey().'+command+'()'
-        eval( run )
-    def shelf(self, blah):
-        shelf = cmds.tabLayout( (mel.eval('$tempvar = $gShelfTopLevel')), st=True, query = True )
-        existing = cmds.shelfLayout( shelf , q=True, ca=True )
-        shelfbutton = 'ConstraintKeyOMGYES'
-        if shelfbutton not in existing: #isn't there
-            cmds.shelfButton( shelfbutton , parent=shelf, image = 'activeSelectedAnimLayer.png', label = 'ConstraintKey', c="from constraintkey import *\nconstraintKeyGUI()" )
+        except Exception as err:
+            raise
+        finally:
+            cmds.undoInfo(closeChunk=True)
+            if err: cmds.undo()
 
-def GUI():
-	constraintKeyGUI()
+    def follow_data(s, constraint, frame_range, driver, driven):
+        """ Stick one object to another! """
+        marker = cmds.spaceLocator()[0]
+        try:
+            matrix = cmds.xform(driven, q=True, ws=True, m=True)
+            roo = cmds.xform(driven, q=True, roo=True) # Copy across rotation order
+            cmds.xform(marker, roo=roo, m=matrix) # Move marker to driven object
+            constraint(driver, marker, mo=True) # Stick it in place
 
-def parent():
-	constraintKey().parent()
+            # Get our base to work from
+            cmds.bakeResults(marker, t=frame_range, sm=True)
 
-def pivot():
-	constraintKey().pivot()
+            # Record keyframes
+            num_keys = int(frame_range[1] - frame_range[0]) + 1
+            attr = [".".join((marker, a)) for a in "trs"]
+            time = cmds.keyframe(attr, q=True, tc=True) or []
+            keys = cmds.keyframe(attr, q=True, vc=True) or []
+            data = itertools.izip(time[:num_keys], *chunk(keys, num_keys))
+        finally:
+            cmds.delete(marker) # clean up!
+        return data
 
-def orient():
-	constraintKey().orient()
+    def stationary_data(s, frame_range, driven):
+        """ Stick one object to the world """
+        t = cmds.xform(driven, ws=True, q=True, t=True)
+        r = cmds.xform(driven, ws=True, q=True, ro=True)
+        s = cmds.xform(driven, ws=True, q=True, s=True)
+        data = ([a]+t+r+s for a in range(int(frame_range[0]), int(frame_range[1]+1)))
+        return data
 
-def point():
-	constraintKey().point()
+    def apply_keys(s, data, frame_range, filter_, driven):
+        """ Apply keyframe data to the object """
+        if not filter_: return warning("No attributes provided")
+        state = cmds.autoKeyframe(q=True, st=True)
+        cmds.autoKeyframe(st=False)
+        try:
+            kwargs = {"ws": True} # Set up our arguments
+            attrs = []
+            if 0 in filter_:
+                attrs.append("%s.t" % driven)
+                kwargs["t"] = None
+            if 1 in filter_:
+                attrs.append("%s.r" % driven)
+                kwargs["ro"] = None
+            if 2 in filter_:
+                attrs.append("%s.s" % driven)
+                kwargs["s"] = None
 
-def aim():
-	constraintKey().aim()
+            cmds.cutKey(attrs, t=frame_range, cl=True) # Remove keys first. Prevents keys between frames
+
+            for t, tx, ty, tz, rx, ry, rz, sx, sy, sz in data:
+                cmds.currentTime(t) # Move to the current frame
+                if "t" in kwargs: kwargs["t"] = (tx, ty, tz)
+                if "ro" in kwargs: kwargs["ro"] = (rx, ry, rz)
+                if "s" in kwargs: kwargs["s"] = (sx, sy, sz)
+                cmds.xform(driven, **kwargs)
+                cmds.setKeyframe(attrs)
+            if "ro" in kwargs: # Clean up with euler filter
+                cmds.filterCurve("%s.r" % driven)
+        finally:
+            cmds.autoKeyframe(st=state)
